@@ -1,6 +1,7 @@
 package nassh
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -23,6 +24,9 @@ const inactivityDuration = 60 * time.Second
 
 type Relay struct {
 	Logger logrus.FieldLogger
+	// Dialer is called to establish the connection to the backend. If not set,
+	// a default net.Dialer is used.
+	Dialer func(ctx context.Context, address string) (net.Conn, error)
 
 	sessions   map[string]*session
 	sessionsMu sync.Mutex
@@ -65,8 +69,13 @@ func (r *Relay) ProxyHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// TODO: Should probably make sure this is only port 22 on allowed hots
-	conn, err := net.Dial("tcp", net.JoinHostPort(host, port))
+	var conn net.Conn
+	var err error
+	if r.Dialer != nil {
+		conn, err = r.Dialer(req.Context(), net.JoinHostPort(host, port))
+	} else {
+		conn, err = (&net.Dialer{}).DialContext(req.Context(), "tcp", net.JoinHostPort(host, port))
+	}
 	if err != nil {
 		r.Logger.WithError(err).WithFields(logrus.Fields{
 			"host": host,
