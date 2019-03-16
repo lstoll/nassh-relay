@@ -255,9 +255,10 @@ func (s *session) loop() {
 			// The entire session is shutting down. Disconnect any connected
 			// client and exit the loop.
 			closeCurrentClient()
-			break
+			goto exit
 		}
 	}
+exit:
 }
 
 func (s *session) serverReadLoop(readCh chan<- serverRead) {
