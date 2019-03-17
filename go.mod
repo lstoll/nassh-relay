@@ -3,6 +3,8 @@ module github.com/lstoll/nassh-relay
 go 1.12
 
 require (
+	github.com/gorilla/securecookie v1.1.1
+	github.com/gorilla/sessions v1.1.3
 	github.com/gorilla/websocket v1.4.0
 	github.com/pkg/errors v0.8.1
 	github.com/sirupsen/logrus v1.3.0

@@ -3,7 +3,7 @@ package nassh
 import (
 	"bytes"
 	"encoding/binary"
-	"net"
+	"io"
 	"sync"
 	"time"
 
@@ -105,7 +105,7 @@ type clientRead struct {
 type session struct {
 	logger logrus.FieldLogger
 	// conn is the connection to the SSH server
-	conn net.Conn
+	conn io.ReadWriteCloser
 	// inactivityDuration is the duration after which, if a client has not
 	// been connected, the session will be automatically closed.
 	inactivityDuration time.Duration
@@ -122,7 +122,7 @@ type session struct {
 }
 
 // newSession creates a new session. Call Start to start reading from the server.
-func newSession(logger logrus.FieldLogger, conn net.Conn, inactivityDuration time.Duration, afterCloseFunc func()) *session {
+func newSession(logger logrus.FieldLogger, conn io.ReadWriteCloser, inactivityDuration time.Duration, afterCloseFunc func()) *session {
 	s := &session{
 		logger:             logger,
 		conn:               conn,

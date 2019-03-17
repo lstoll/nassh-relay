@@ -5,49 +5,97 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/gorilla/securecookie"
+	"github.com/gorilla/sessions"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 )
 
-const bsidLength = 16
+const (
+	bsidLength  = 16
+	sessionName = "nassh-session"
+)
 
 // TODO: Determine or leave configurable
 const inactivityDuration = 60 * time.Second
 
 // https://chromium.googlesource.com/apps/libapps/+show/master/nassh/doc/relay-protocol.md
 
+// Relay is a server implementation of the nassh relay protocol.
 type Relay struct {
+	// Logger to output information to. If not set, it will be initialized to a
+	// null logger.
 	Logger logrus.FieldLogger
 	// Dialer is called to establish the connection to the backend. If not set,
-	// a default net.Dialer is used.
-	Dialer func(ctx context.Context, address string) (net.Conn, error)
+	// the host:port is dialed with a default net.Dialer
+	Dialer func(ctx context.Context, add string) (io.ReadWriteCloser, error)
+
+	// HTTPSession is a HTTP session store. It is used to track state across
+	// calls. It should be resistent to tampering, to ensure sessions are not
+	// spoofed. If not set, it will be initialized to a new cookie store with a
+	// random secret on first use.
+	HTTPSession sessions.Store
 
 	sessions   map[string]*session
 	sessionsMu sync.Mutex
+
+	once sync.Once
 }
 
-// SimpleCookieHandler simply starts the session and returns the user to the
-// extension, with no authentication. Serve at /cookie
-func (r *Relay) SimpleCookieHandler(w http.ResponseWriter, req *http.Request) {
-	ext := req.URL.Query().Get("ext")
-	path := req.URL.Query().Get("path")
+func (r *Relay) init() {
+	r.once.Do(func() {
+		if r.HTTPSession == nil {
+			r.HTTPSession = sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)))
+		}
+		if r.Logger == nil {
+			r.Logger, _ = test.NewNullLogger()
+		}
+	})
+}
+
+// StartSession should be called at the end of the authentication flow that was
+// initialized by a call to /cookie . userID corresponds to a unique identifier
+// for the user, for tracking. loginSessID can track the auth session in use,
+// for referencing later on. The values of ext, path, version, and method should
+// correspond to the query values for the original /cookie call. It should be
+// provided an unused ResponseWriter
+func (r *Relay) StartSession(w http.ResponseWriter, req *http.Request, userID, loginSessID, ext, path, version, method string) {
+	r.init()
+
 	if ext == "" || path == "" {
 		http.Error(w, "ext and path are required params", http.StatusBadRequest)
 		return
 	}
-	version := req.URL.Query().Get("version")
 	if version != "" && version != "2" {
 		// TODO - we're not really supporting v2 properly
 		http.Error(w, "only version 2 is supported", http.StatusBadRequest)
 		return
 	}
-	method := req.URL.Query().Get("method")
+
+	sess, err := r.HTTPSession.Get(req, sessionName)
+	if err != nil {
+		r.Logger.WithError(err).Error("error fetching session")
+		http.Error(w, "error fetching session", http.StatusInternalServerError)
+		return
+	}
+
+	sess.Values["userID"] = userID
+	sess.Values["loginSessID"] = loginSessID
+
+	if err := sess.Save(req, w); err != nil {
+		r.Logger.WithError(err).Error("error saving session")
+		http.Error(w, "error saving session", http.StatusInternalServerError)
+		return
+	}
+
 	if method == "" {
 		http.Redirect(w, req, fmt.Sprintf("chrome-extension://%s/%s#anonymous@%s", ext, path, req.Host), http.StatusFound)
 	} else if method == "js-redirect" {
@@ -62,6 +110,8 @@ func (r *Relay) SimpleCookieHandler(w http.ResponseWriter, req *http.Request) {
 // ProxyHandler starts the remote connection. Serve at /proxy
 // https://chromium.googlesource.com/apps/libapps/+show/c4b90ef4973513b8e9052f0cff56e8717dc9faf9/nassh/doc/relay-protocol.md#153
 func (r *Relay) ProxyHandler(w http.ResponseWriter, req *http.Request) {
+	r.init()
+
 	host := req.URL.Query().Get("host")
 	port := req.URL.Query().Get("port")
 	if host == "" || port == "" {
@@ -69,10 +119,39 @@ func (r *Relay) ProxyHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var conn net.Conn
-	var err error
+	sess, err := r.HTTPSession.Get(req, sessionName)
+	if err != nil {
+		r.Logger.WithError(err).Error("error fetching session")
+		http.Error(w, "error fetching session", http.StatusInternalServerError)
+		return
+	}
+
+	ui, uok := sess.Values["userID"]
+	li, lok := sess.Values["loginSessID"]
+	if !uok || !lok {
+		r.Logger.WithError(err).Error("session missing required information")
+		http.Error(w, "session missing required information", http.StatusBadRequest)
+		return
+	}
+	userID := ui.(string)
+	loginSessID := li.(string)
+
+	bsid := make([]byte, bsidLength)
+	if _, err := rand.Read(bsid); err != nil {
+		r.Logger.WithError(err).Error("error generating session ID")
+		http.Error(w, "error generating session ID", http.StatusInternalServerError)
+		return
+	}
+	sid := hex.EncodeToString(bsid)
+
+	ctx := context.WithValue(req.Context(), ctxUserID, userID)
+	ctx = context.WithValue(ctx, ctxLoginSession, loginSessID)
+	ctx = context.WithValue(ctx, ctxSSHSession, sid)
+	ctx = context.WithValue(ctx, ctxRemoteAddr, req.RemoteAddr)
+
+	var conn io.ReadWriteCloser
 	if r.Dialer != nil {
-		conn, err = r.Dialer(req.Context(), net.JoinHostPort(host, port))
+		conn, err = r.Dialer(ctx, net.JoinHostPort(host, port))
 	} else {
 		conn, err = (&net.Dialer{}).DialContext(req.Context(), "tcp", net.JoinHostPort(host, port))
 	}
@@ -85,15 +164,6 @@ func (r *Relay) ProxyHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "error establishing connection to server", http.StatusInternalServerError)
 		return
 	}
-
-	bsid := make([]byte, bsidLength)
-	if _, err := rand.Read(bsid); err != nil {
-		r.Logger.WithError(err).Error("error generating session ID")
-
-		http.Error(w, "error generating session ID", http.StatusInternalServerError)
-		return
-	}
-	sid := hex.EncodeToString(bsid)
 
 	afterCloseFunc := func() {
 		r.Logger.WithField("sid", sid).Info("closed")
